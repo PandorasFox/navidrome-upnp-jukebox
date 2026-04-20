@@ -1,0 +1,346 @@
+import { useState, useEffect, useRef } from 'react';
+import './App.css';
+
+const API = '/api';
+
+function App() {
+  const [queue, setQueue] = useState([]);
+  const [nowPlaying, setNowPlaying] = useState(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [renderer, setRenderer] = useState({ position: 0, duration: 0, transportState: '' });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchMode, setSearchMode] = useState('tracks');
+  const [searchResults, setSearchResults] = useState([]);
+  const [addNext, setAddNext] = useState(false);
+  const [drillDown, setDrillDown] = useState(null);
+  // drillDown: null | { type: 'albumTracks', album, tracks } | { type: 'artistAlbums', artist, albums }
+  const searchTimeoutRef = useRef(null);
+  const searchContainerRef = useRef(null);
+
+  useEffect(() => {
+    const handleClick = (e) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target)) {
+        setSearchResults([]);
+        setDrillDown(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  useEffect(() => {
+    const evtSource = new EventSource(`${API}/sse`);
+    evtSource.onmessage = (e) => {
+      const state = JSON.parse(e.data);
+      setQueue(state.queue || []);
+      setNowPlaying(state.nowPlaying || null);
+      setIsRunning(state.isRunning ?? false);
+      if (state.renderer) setRenderer(state.renderer);
+    };
+    return () => evtSource.close();
+  }, []);
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    setDrillDown(null);
+
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    searchTimeoutRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API}/search?q=${encodeURIComponent(searchQuery)}&type=${searchMode}`);
+        const data = await res.json();
+        if (searchMode === 'albums') setSearchResults(data.albums || []);
+        else if (searchMode === 'artists') setSearchResults(data.artists || []);
+        else setSearchResults(data.tracks || []);
+      } catch (err) {
+        console.error('Search failed:', err);
+      }
+    }, 300);
+
+    return () => { if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current); };
+  }, [searchQuery, searchMode]);
+
+  const addTrack = async (track) => {
+    await fetch(`${API}/queue/add${addNext ? '?next=1' : ''}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(track),
+    });
+  };
+
+  const addAlbum = async (album) => {
+    await fetch(`${API}/queue/add-album${addNext ? '?next=1' : ''}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ albumId: album.albumId }),
+    });
+  };
+
+  const drillIntoAlbum = async (album, parentDrill = null) => {
+    try {
+      const res = await fetch(`${API}/album/tracks?albumId=${encodeURIComponent(album.albumId)}`);
+      const data = await res.json();
+      setDrillDown({ type: 'albumTracks', album, tracks: data.tracks || [], parentDrill });
+    } catch (err) {
+      console.error('Failed to load album tracks:', err);
+    }
+  };
+
+  const drillIntoArtist = async (artist) => {
+    try {
+      const res = await fetch(`${API}/artist/albums?artist=${encodeURIComponent(artist.artist)}`);
+      const data = await res.json();
+      setDrillDown({ type: 'artistAlbums', artist: artist.artist, albums: data.albums || [] });
+    } catch (err) {
+      console.error('Failed to load artist albums:', err);
+    }
+  };
+
+  const dismissSearch = () => {
+    setSearchQuery('');
+    setSearchResults([]);
+    setDrillDown(null);
+  };
+
+  const removeTrack = async (idx) => {
+    await fetch(`${API}/queue/${idx}`, { method: 'DELETE' });
+  };
+
+  const play = () => fetch(`${API}/play`, { method: 'POST' });
+  const pause = () => fetch(`${API}/pause`, { method: 'POST' });
+  const stop = () => fetch(`${API}/stop`, { method: 'POST' });
+  const next = () => fetch(`${API}/next`, { method: 'POST' });
+  const shuffle = () => fetch(`${API}/queue/shuffle`, { method: 'POST' });
+  const clearQueue = () => fetch(`${API}/queue/clear`, { method: 'POST' });
+
+  const formatDuration = (seconds) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const currentTrack = nowPlaying;
+  const showResults = searchResults.length > 0 || drillDown;
+
+  // --- Render helpers ---
+
+  const renderTrackList = (tracks, { showAlbum = true } = {}) => (
+    tracks.map((track) => (
+      <div key={track.id} className="result-item" onClick={() => addTrack(track)}>
+        <img src={`${API}/cover/${track.coverArt}`} alt="" className="result-art"
+          onError={(e) => (e.target.style.display = 'none')} />
+        <div className="result-info">
+          <div className="result-title">{track.title}</div>
+          <div className="result-artist">
+            {showAlbum ? `${track.artist} — ${track.album}` : track.artist}
+          </div>
+        </div>
+        {track.duration > 0 && <div className="result-duration">{formatDuration(track.duration)}</div>}
+        <button className="add-btn">+</button>
+      </div>
+    ))
+  );
+
+  const renderAlbumGrid = (albums, onAlbumClick) => (
+    <div className="tile-grid">
+      {albums.map((album) => (
+        <div key={album.albumId} className="tile" onClick={() => onAlbumClick(album)}>
+          <img src={`${API}/cover/${album.coverArt}`} alt="" className="tile-art"
+            onError={(e) => (e.target.style.visibility = 'hidden')} />
+          <div className="tile-label">{album.album}</div>
+          <div className="tile-sub">{album.artist} · {album.trackCount} tracks</div>
+        </div>
+      ))}
+    </div>
+  );
+
+  const renderArtistGrid = (artists) => (
+    <div className="tile-grid">
+      {artists.map((artist) => (
+        <div key={artist.artist} className="tile" onClick={() => drillIntoArtist(artist)}>
+          <img src={`${API}/cover/${artist.coverArt}`} alt="" className="tile-art"
+            onError={(e) => (e.target.style.visibility = 'hidden')} />
+          <div className="tile-label">{artist.artist}</div>
+          <div className="tile-sub">{artist.albumCount} {artist.albumCount === 1 ? 'album' : 'albums'}</div>
+        </div>
+      ))}
+    </div>
+  );
+
+  const renderDrillDown = () => {
+    if (!drillDown) return null;
+
+    if (drillDown.type === 'albumTracks') {
+      const { album, tracks } = drillDown;
+      return (
+        <>
+          <div className="drill-header">
+            <button className="back-btn" onClick={() => {
+              // Go back: if we came from an artist, restore artist albums; otherwise clear
+              setDrillDown(drillDown.parentDrill || null);
+            }}>←</button>
+            <img src={`${API}/cover/${album.coverArt}`} alt="" className="drill-art"
+              onError={(e) => (e.target.style.display = 'none')} />
+            <div className="drill-info">
+              <div className="drill-title">{album.album}</div>
+              <div className="drill-sub">{album.artist}</div>
+            </div>
+            <button className="queue-all-btn" onClick={() => { addAlbum(album); dismissSearch(); }}>
+              Queue All
+            </button>
+          </div>
+          {renderTrackList(tracks, { showAlbum: false })}
+        </>
+      );
+    }
+
+    if (drillDown.type === 'artistAlbums') {
+      const { artist, albums } = drillDown;
+      return (
+        <>
+          <div className="drill-header">
+            <button className="back-btn" onClick={() => setDrillDown(null)}>←</button>
+            <div className="drill-info">
+              <div className="drill-title">{artist}</div>
+              <div className="drill-sub">{albums.length} {albums.length === 1 ? 'album' : 'albums'}</div>
+            </div>
+          </div>
+          {renderAlbumGrid(albums, (album) => drillIntoAlbum(album, drillDown))}
+        </>
+      );
+    }
+
+    return null;
+  };
+
+  const renderSearchResults = () => {
+    if (drillDown) return renderDrillDown();
+    if (searchResults.length === 0) return null;
+
+    if (searchMode === 'tracks') return renderTrackList(searchResults);
+    if (searchMode === 'albums') return renderAlbumGrid(searchResults, drillIntoAlbum);
+    if (searchMode === 'artists') return renderArtistGrid(searchResults);
+    return null;
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>🎵 Jukebox</h1>
+      </header>
+
+      <div className="search-container" ref={searchContainerRef}>
+        <input
+          type="text"
+          className="search-input"
+          placeholder={
+            searchMode === 'albums' ? 'Search for albums...' :
+            searchMode === 'artists' ? 'Search for artists...' :
+            'Search for tracks...'
+          }
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          autoFocus
+        />
+        <div className="search-options">
+          <div className="search-chips">
+            <button className={`chip ${searchMode === 'tracks' ? 'active' : ''}`}
+              onClick={() => { setSearchMode('tracks'); setSearchResults([]); setDrillDown(null); }}>
+              Tracks
+            </button>
+            <button className={`chip ${searchMode === 'albums' ? 'active' : ''}`}
+              onClick={() => { setSearchMode('albums'); setSearchResults([]); setDrillDown(null); }}>
+              Albums
+            </button>
+            <button className={`chip ${searchMode === 'artists' ? 'active' : ''}`}
+              onClick={() => { setSearchMode('artists'); setSearchResults([]); setDrillDown(null); }}>
+              Artists
+            </button>
+          </div>
+          <label className="add-next-toggle" onClick={() => setAddNext(!addNext)}>
+            <span className="add-next-label">add next?</span>
+            <span className={`toggle-switch ${addNext ? 'on' : ''}`}>
+              <span className="toggle-knob" />
+            </span>
+          </label>
+        </div>
+
+        {showResults && (
+          <div className="search-results">
+            {renderSearchResults()}
+          </div>
+        )}
+      </div>
+
+      {currentTrack && (
+        <div className="now-playing">
+          <img
+            src={`${API}/cover/${currentTrack.coverArt}`}
+            alt=""
+            className="now-playing-art"
+            onError={(e) => (e.target.style.display = 'none')}
+          />
+          <div className="now-playing-info">
+            <div className="now-playing-title">Now Playing: {currentTrack.title}</div>
+            <div className="now-playing-artist">{currentTrack.artist}</div>
+            {renderer.duration > 0 && (
+              <div className="now-playing-progress">
+                <div className="progress-bar">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.min(100, (renderer.position / renderer.duration) * 100)}%` }}
+                  />
+                </div>
+                <div className="progress-time">
+                  <span>{formatDuration(renderer.position)}</span>
+                  <span>{formatDuration(renderer.duration)}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="controls">
+        <button className="btn primary" onClick={play} disabled={queue.length === 0 && !currentTrack}>
+          ▶ Play
+        </button>
+        <button className="btn" onClick={pause}>⏸ Pause</button>
+        <button className="btn" onClick={stop}>⏹ Stop</button>
+        <button className="btn" onClick={next} disabled={queue.length === 0}>⏭ Next</button>
+        <button className="btn" onClick={shuffle} disabled={queue.length < 2}>🔀 Shuffle</button>
+        <button className="btn danger" onClick={clearQueue} disabled={queue.length === 0}>🗑 Clear</button>
+      </div>
+
+      <div className="queue-section">
+        <h2 className="queue-heading">
+          Up Next ({queue.length} {queue.length === 1 ? 'track' : 'tracks'})
+        </h2>
+
+        {queue.length === 0 ? (
+          <div className="empty-message">Queue is empty. Search and add tracks!</div>
+        ) : (
+          <div className="queue">
+            {queue.map((track, idx) => (
+              <div key={`${track.id}-${idx}`} className="queue-item">
+                <img src={`${API}/cover/${track.coverArt}`} alt="" className="queue-art"
+                  onError={(e) => (e.target.style.display = 'none')} />
+                <div className="queue-info">
+                  <div className="queue-track-title">{track.title}</div>
+                  <div className="queue-artist">{track.artist} — {track.album}</div>
+                </div>
+                <div className="queue-duration">{formatDuration(track.duration)}</div>
+                <button className="remove-btn" onClick={() => removeTrack(idx)} title="Remove">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
