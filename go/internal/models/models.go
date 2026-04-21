@@ -32,6 +32,7 @@ type SystemState struct {
 	NowPlaying *QueueItem    `json:"nowPlaying"`
 	Renderer   PlaybackState `json:"renderer"`
 	IsRunning  bool          `json:"isRunning"`
+	RadioMode  bool          `json:"radioMode"`
 }
 
 // SearchResponse matches Navidrome's Subsonic XML search results

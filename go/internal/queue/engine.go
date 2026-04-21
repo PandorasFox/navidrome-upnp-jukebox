@@ -20,8 +20,12 @@ type Engine struct {
 	queue      []models.QueueItem
 	nowPlaying *models.QueueItem
 	isRunning  bool
+	radioMode  bool
 	renderer   models.PlaybackState
 	db         *sql.DB
+
+	// Called when radio mode is on and queue depth <= 3
+	RadioFillFunc func()
 
 	// SSE subscribers
 	subMu       sync.RWMutex
@@ -49,6 +53,10 @@ func NewEngine(dbPath string) (*Engine, error) {
 			position INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_queue_position ON queue(position);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tables: %w", err)
@@ -63,6 +71,12 @@ func NewEngine(dbPath string) (*Engine, error) {
 
 	if err := e.loadQueue(); err != nil {
 		return nil, fmt.Errorf("failed to load queue: %w", err)
+	}
+
+	// Load persisted radio mode
+	var radioVal int
+	if err := db.QueryRow("SELECT value FROM settings WHERE key = 'radio_mode'").Scan(&radioVal); err == nil {
+		e.radioMode = radioVal == 1
 	}
 
 	return e, nil
@@ -164,6 +178,7 @@ func (e *Engine) PopNext() *models.QueueItem {
 	}
 	e.broadcastLocked()
 	e.mu.Unlock()
+	e.checkRadioFill()
 	return &item
 }
 
@@ -189,11 +204,39 @@ func (e *Engine) RemoveByTrackID(trackID string) bool {
 			}
 			e.broadcastLocked()
 			e.mu.Unlock()
+			e.checkRadioFill()
 			return true
 		}
 	}
 	e.mu.Unlock()
 	return false
+}
+
+// Reorder moves queue[from] to position [to], but only if queue[from].ID matches trackID.
+// Returns false if the index is out of range or the track ID doesn't match (stale drag).
+func (e *Engine) Reorder(from, to int, trackID string) bool {
+	e.mu.Lock()
+	if from < 0 || from >= len(e.queue) || to < 0 || to >= len(e.queue) {
+		e.mu.Unlock()
+		return false
+	}
+	if e.queue[from].ID != trackID {
+		e.mu.Unlock()
+		return false
+	}
+
+	item := e.queue[from]
+	// Remove from old position
+	e.queue = append(e.queue[:from], e.queue[from+1:]...)
+	// Insert at new position
+	e.queue = append(e.queue[:to], append([]models.QueueItem{item}, e.queue[to:]...)...)
+
+	if err := e.saveQueue(); err != nil {
+		fmt.Printf("Failed to save queue: %v\n", err)
+	}
+	e.broadcastLocked()
+	e.mu.Unlock()
+	return true
 }
 
 // Remove removes a track from the queue by index
@@ -210,6 +253,7 @@ func (e *Engine) Remove(idx int) bool {
 	}
 	e.broadcastLocked()
 	e.mu.Unlock()
+	e.checkRadioFill()
 	return true
 }
 
@@ -276,6 +320,41 @@ func (e *Engine) SetRunning(running bool) {
 	e.mu.Unlock()
 }
 
+// RadioMode returns whether radio mode is enabled
+func (e *Engine) RadioMode() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.radioMode
+}
+
+// SetRadioMode enables or disables radio mode
+func (e *Engine) SetRadioMode(on bool) {
+	e.mu.Lock()
+	e.radioMode = on
+	val := 0
+	if on {
+		val = 1
+	}
+	e.db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES ('radio_mode', ?)", val)
+	e.broadcastLocked()
+	needFill := on && len(e.queue) <= 3 && e.RadioFillFunc != nil
+	e.mu.Unlock()
+	if needFill {
+		e.RadioFillFunc()
+	}
+}
+
+// checkRadioFill triggers the fill callback if radio mode is on and queue is low.
+// Must NOT be called while e.mu is held.
+func (e *Engine) checkRadioFill() {
+	e.mu.RLock()
+	needFill := e.radioMode && len(e.queue) <= 3 && e.RadioFillFunc != nil
+	e.mu.RUnlock()
+	if needFill {
+		e.RadioFillFunc()
+	}
+}
+
 // SetRenderer updates the renderer playback state and broadcasts
 func (e *Engine) SetRenderer(state models.PlaybackState) {
 	e.mu.Lock()
@@ -304,6 +383,7 @@ func (e *Engine) State() models.SystemState {
 		NowPlaying: e.nowPlaying,
 		IsRunning:  e.isRunning,
 		Renderer:   e.renderer,
+		RadioMode:  e.radioMode,
 	}
 }
 
@@ -315,6 +395,7 @@ func (e *Engine) broadcastLocked() {
 		NowPlaying: e.nowPlaying,
 		IsRunning:  e.isRunning,
 		Renderer:   e.renderer,
+		RadioMode:  e.radioMode,
 	}
 	copy(state.Queue, e.queue)
 	data, _ := json.Marshal(state)

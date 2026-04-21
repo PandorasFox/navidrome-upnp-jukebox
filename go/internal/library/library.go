@@ -327,6 +327,29 @@ func (l *Library) GetAlbumTracks(albumID string) ([]map[string]interface{}, erro
 	return results, rows.Err()
 }
 
+// GetRandomTracks returns n random tracks from the library
+func (l *Library) GetRandomTracks(n int) []models.QueueItem {
+	rows, err := l.db.Query(`
+		SELECT id, title, artist, album, COALESCE(duration, 0), COALESCE(cover_art, '')
+		FROM songs ORDER BY RANDOM() LIMIT ?
+	`, n)
+	if err != nil {
+		log.Printf("[library.GetRandomTracks] query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var tracks []models.QueueItem
+	for rows.Next() {
+		var item models.QueueItem
+		if err := rows.Scan(&item.ID, &item.Title, &item.Artist, &item.Album, &item.Duration, &item.CoverArt); err != nil {
+			continue
+		}
+		tracks = append(tracks, item)
+	}
+	return tracks
+}
+
 // GetTrackByID looks up a single track by its Navidrome ID
 func (l *Library) GetTrackByID(trackID string) *models.QueueItem {
 	var id, title, artist, album, coverArt string

@@ -12,6 +12,8 @@ function App() {
   const [searchMode, setSearchMode] = useState('tracks');
   const [searchResults, setSearchResults] = useState([]);
   const [addNext, setAddNext] = useState(false);
+  const [radioMode, setRadioMode] = useState(false);
+  const prevPositionRef = useRef(0);
   const [drillDown, setDrillDown] = useState(null);
   // drillDown: null | { type: 'albumTracks', album, tracks } | { type: 'artistAlbums', artist, albums }
   const searchTimeoutRef = useRef(null);
@@ -35,6 +37,7 @@ function App() {
       setQueue(state.queue || []);
       setNowPlaying(state.nowPlaying || null);
       setIsRunning(state.isRunning ?? false);
+      setRadioMode(state.radioMode ?? false);
       if (state.renderer) setRenderer(state.renderer);
     };
     return () => evtSource.close();
@@ -109,11 +112,45 @@ function App() {
     await fetch(`${API}/queue/${idx}`, { method: 'DELETE' });
   };
 
+  const dragItem = useRef(null);
+  const dragOverItem = useRef(null);
+
+  const handleDragStart = (idx, trackId) => {
+    dragItem.current = { idx, trackId };
+  };
+
+  const handleDragOver = (e, idx) => {
+    e.preventDefault();
+    dragOverItem.current = idx;
+  };
+
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    if (dragItem.current === null || dragOverItem.current === null) return;
+    const { idx: from, trackId } = dragItem.current;
+    const to = dragOverItem.current;
+    if (from === to) return;
+    await fetch(`${API}/queue/reorder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to, trackId }),
+    });
+    dragItem.current = null;
+    dragOverItem.current = null;
+  };
+
+  const toggleRadio = async () => {
+    await fetch(`${API}/radio`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !radioMode }),
+    });
+  };
+
   const play = () => fetch(`${API}/play`, { method: 'POST' });
   const pause = () => fetch(`${API}/pause`, { method: 'POST' });
   const stop = () => fetch(`${API}/stop`, { method: 'POST' });
   const next = () => fetch(`${API}/next`, { method: 'POST' });
-  const shuffle = () => fetch(`${API}/queue/shuffle`, { method: 'POST' });
   const clearQueue = () => fetch(`${API}/queue/clear`, { method: 'POST' });
 
   const formatDuration = (seconds) => {
@@ -124,6 +161,8 @@ function App() {
 
   const currentTrack = nowPlaying;
   const showResults = searchResults.length > 0 || drillDown;
+  const progressReset = renderer.position < prevPositionRef.current - 2;
+  prevPositionRef.current = renderer.position;
 
   // --- Render helpers ---
 
@@ -229,7 +268,7 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>🎵 Jukebox</h1>
+        <h1>navidrome upnp jukebox</h1>
       </header>
 
       <div className="search-container" ref={searchContainerRef}>
@@ -290,7 +329,7 @@ function App() {
               <div className="now-playing-progress">
                 <div className="progress-bar">
                   <div
-                    className="progress-fill"
+                    className={`progress-fill${progressReset ? ' reset' : ''}`}
                     style={{ width: `${Math.min(100, (renderer.position / renderer.duration) * 100)}%` }}
                   />
                 </div>
@@ -305,13 +344,19 @@ function App() {
       )}
 
       <div className="controls">
-        <button className="btn primary" onClick={play} disabled={queue.length === 0 && !currentTrack}>
-          ▶ Play
-        </button>
-        <button className="btn" onClick={pause}>⏸ Pause</button>
+        {renderer.transportState === 'PLAYING' ? (
+          <button className="btn primary" onClick={pause}>⏸ Pause</button>
+        ) : (
+          <button className="btn primary" onClick={play} disabled={queue.length === 0 && !currentTrack}>
+            ▶ Play
+          </button>
+        )}
         <button className="btn" onClick={stop}>⏹ Stop</button>
         <button className="btn" onClick={next} disabled={queue.length === 0}>⏭ Next</button>
-        <button className="btn" onClick={shuffle} disabled={queue.length < 2}>🔀 Shuffle</button>
+        <button className={`btn ${radioMode ? 'radio-active' : ''}`} onClick={toggleRadio}
+          title="Auto-adds 10 random songs to queue when queue is 3 or fewer items deep">
+          📻 Radio
+        </button>
         <button className="btn danger" onClick={clearQueue} disabled={queue.length === 0}>🗑 Clear</button>
       </div>
 
@@ -325,7 +370,13 @@ function App() {
         ) : (
           <div className="queue">
             {queue.map((track, idx) => (
-              <div key={`${track.id}-${idx}`} className="queue-item">
+              <div key={`${track.id}-${idx}`} className="queue-item"
+                draggable
+                onDragStart={() => handleDragStart(idx, track.id)}
+                onDragOver={(e) => handleDragOver(e, idx)}
+                onDrop={handleDrop}
+              >
+                <span className="drag-handle">⠿</span>
                 <img src={`${API}/cover/${track.coverArt}`} alt="" className="queue-art"
                   onError={(e) => (e.target.style.display = 'none')} />
                 <div className="queue-info">

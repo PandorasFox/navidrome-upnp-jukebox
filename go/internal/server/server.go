@@ -69,7 +69,7 @@ func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr string) 
 	// Create UPnP client
 	upnpClient := upnp.NewClient(rendererAddr)
 
-	return &Server{
+	srv := &Server{
 		queueEngine:      qe,
 		lib:              lib,
 		navidrome:        nvClient,
@@ -77,7 +77,11 @@ func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr string) 
 		upnpStatus:       UPnPStatusUnconnected,
 		navidromeBaseURL: navidromeURL,
 		rendererName:     rendererAddr,
-	}, nil
+	}
+
+	qe.RadioFillFunc = srv.radioFill
+
+	return srv, nil
 }
 
 // StartUPnP discovers and connects to the renderer
@@ -381,6 +385,9 @@ func (s *Server) Routes() http.Handler {
 	r.Get("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "frontend/favicon.svg")
 	})
+	r.Get("/particles.js", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "frontend/particles.js")
+	})
 	r.Get("/{*path}", s.handleFrontend) // Catch-all for SPA routes
 
 	// API routes
@@ -393,6 +400,7 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/queue/add-album", s.handleAddAlbum)
 		r.Delete("/queue/{idx}", s.handleRemoveFromQueue)
 		r.Post("/queue/clear", s.handleClearQueue)
+		r.Post("/queue/reorder", s.handleReorderQueue)
 		r.Post("/queue/shuffle", s.handleShuffleQueue)
 		r.Get("/state", s.handleGetState)
 		r.Post("/play", s.handlePlay)
@@ -404,6 +412,7 @@ func (s *Server) Routes() http.Handler {
 		r.Get("/cover/{id}", s.handleCoverArt)
 		r.Get("/sync/status", s.handleSyncStatus)
 		r.Post("/sync", s.handleSync)
+		r.Post("/radio", s.handleRadioToggle)
 		r.Get("/upnp/status", s.handleUPnPStatus)
 		r.Post("/upnp/reconnect", s.handleUPnPReconnect)
 	})
@@ -601,6 +610,25 @@ func (s *Server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("{\"ok\":true}"))
 }
 
+// handleReorderQueue moves a queue item from one position to another
+func (s *Server) handleReorderQueue(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		From    int    `json:"from"`
+		To      int    `json:"to"`
+		TrackID string `json:"trackId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.queueEngine.Reorder(req.From, req.To, req.TrackID) {
+		http.Error(w, "reorder rejected (stale index or track mismatch)", http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("{\"ok\":true}"))
+}
+
 // handleShuffleQueue shuffles the queue
 func (s *Server) handleShuffleQueue(w http.ResponseWriter, r *http.Request) {
 	s.queueEngine.Shuffle()
@@ -794,6 +822,30 @@ func (s *Server) handleUPnPStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": s.GetUPnPStatus(),
 	})
+}
+
+// handleRadioToggle toggles radio mode
+func (s *Server) handleRadioToggle(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.queueEngine.SetRadioMode(req.Enabled)
+	log.Printf("[radio] mode set to %v", req.Enabled)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte("{\"ok\":true}"))
+}
+
+// radioFill adds 10 random tracks to the queue
+func (s *Server) radioFill() {
+	tracks := s.lib.GetRandomTracks(10)
+	for _, t := range tracks {
+		s.queueEngine.Add(t)
+	}
+	log.Printf("[radio] added %d random tracks to queue", len(tracks))
 }
 
 // handleUPnPReconnect retries connecting to the renderer
