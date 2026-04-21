@@ -1,0 +1,16 @@
+services:
+  jukebox:
+    image: ghcr.io/pandorasfox/navidrome-upnpn-jukebox:main
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - NAVIDROME_URL=http://localhost:4533
+      - NAVIDROME_USER=jukebox
+      - NAVIDROME_PASS=changeme
+      - RENDERER_NAME=RX-A4A       # UPnP renderer name prefix to discover
+      - LISTEN=:8013
+    volumes:
+      - jukebox_data:/data
+
+volumes:
+  jukebox_data:

@@ -1,20 +1,16 @@
 FROM node:20-alpine AS frontend-builder
 
-ARG FRONTEND_HASH
 WORKDIR /build/frontend-react
-COPY ../frontend-react/package.json ../frontend-react/package-lock.json ./
+COPY frontend-react/package.json frontend-react/package-lock.json ./
 RUN npm ci
-COPY ../frontend-react/ .
-RUN echo "Frontend hash: ${FRONTEND_HASH}" && npm run build
+COPY frontend-react/ .
+RUN npm run build
 
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /build
 
-ARG BACKEND_HASH
-ARG FRONTEND_HASH
-
-RUN echo "Backend hash: ${BACKEND_HASH}  Frontend hash: ${FRONTEND_HASH}" && apk add --no-cache gcc musl-dev
+RUN apk add --no-cache gcc musl-dev
 
 COPY go/go.mod go/go.sum ./
 RUN go mod download
