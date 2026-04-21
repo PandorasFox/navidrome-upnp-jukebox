@@ -9,6 +9,8 @@ services:
       - NAVIDROME_PASS=changeme
       - RENDERER_NAME=RX-A4A       # UPnP renderer name prefix to discover
       - LISTEN=:8013
+      # - LASTFM_API_KEY=           # Optional: enables Last.fm scrobbling
+      # - LASTFM_API_SECRET=        # Required if API key is set
     volumes:
       - jukebox_data:/data
 

@@ -17,6 +17,8 @@ func main() {
 	navidromePass := flag.String("navidrome-pass", getEnv("NAVIDROME_PASS", ""), "Navidrome password")
 	rendererName := flag.String("renderer", getEnv("RENDERER_NAME", ""), "UPnP renderer name prefix for discovery (e.g., RX-A4A)")
 	listenAddr := flag.String("listen", getEnv("LISTEN", ":8080"), "Listen address")
+	lastfmKey := flag.String("lastfm-key", getEnv("LASTFM_API_KEY", ""), "Last.fm API key (optional, enables scrobbling)")
+	lastfmSecret := flag.String("lastfm-secret", getEnv("LASTFM_API_SECRET", ""), "Last.fm API secret")
 	flag.Parse()
 
 	// Require renderer name
@@ -25,7 +27,7 @@ func main() {
 	}
 
 	// Create server
-	app, err := server.NewServer(*navidromeURL, *navidromeUser, *navidromePass, *rendererName)
+	app, err := server.NewServer(*navidromeURL, *navidromeUser, *navidromePass, *rendererName, *lastfmKey, *lastfmSecret)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
@@ -55,6 +57,11 @@ func main() {
 	log.Printf("Starting jukebox server on %s", *listenAddr)
 	log.Printf("Navidrome: %s", *navidromeURL)
 	log.Printf("Renderer name: %s", *rendererName)
+	if *lastfmKey != "" {
+		log.Printf("Last.fm scrobbling: enabled")
+	} else {
+		log.Printf("Last.fm scrobbling: disabled (set LASTFM_API_KEY to enable)")
+	}
 
 	if err := http.ListenAndServe(*listenAddr, r); err != nil {
 		log.Fatalf("Server failed: %v", err)

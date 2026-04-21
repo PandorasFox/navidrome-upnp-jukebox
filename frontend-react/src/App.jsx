@@ -13,6 +13,7 @@ function App() {
   const [searchResults, setSearchResults] = useState([]);
   const [addNext, setAddNext] = useState(false);
   const [radioMode, setRadioMode] = useState(false);
+  const [user, setUser] = useState(null);
   const prevPositionRef = useRef(0);
   const [drillDown, setDrillDown] = useState(null);
   // drillDown: null | { type: 'albumTracks', album, tracks } | { type: 'artistAlbums', artist, albums }
@@ -41,6 +42,13 @@ function App() {
       if (state.renderer) setRenderer(state.renderer);
     };
     return () => evtSource.close();
+  }, []);
+
+  useEffect(() => {
+    fetch(`${API}/me`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data) setUser(data); })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -270,6 +278,25 @@ function App() {
       <header className="header">
         <h1>navidrome upnp jukebox</h1>
       </header>
+
+      {user?.lastfmEnabled && (
+        <div className="lastfm-status">
+          {user.lastfmUser ? (
+            <span className="lastfm-linked">
+              <span className="lastfm-dot" />
+              {user.lastfmUser}
+              <button className="lastfm-unlink" onClick={async () => {
+                await fetch(`${API}/lastfm/link`, { method: 'DELETE' });
+                setUser(u => ({ ...u, lastfmUser: null }));
+              }}>unlink</button>
+            </span>
+          ) : (
+            <a href={`${API}/lastfm/link`} className="lastfm-link-btn">
+              Link Last.fm
+            </a>
+          )}
+        </div>
+      )}
 
       <div className="search-container" ref={searchContainerRef}>
         <input

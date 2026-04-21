@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/hecate/navidrome-jukebox/internal/lastfm"
 	"github.com/hecate/navidrome-jukebox/internal/library"
 	"github.com/hecate/navidrome-jukebox/internal/models"
 	"github.com/hecate/navidrome-jukebox/internal/navidrome"
@@ -45,10 +47,13 @@ type Server struct {
 	// Config
 	navidromeBaseURL string
 	rendererName     string
+
+	// Last.fm (nil if not configured)
+	lastfmScrobbler *lastfm.Scrobbler
 }
 
 // NewServer creates a new server instance
-func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr string) (*Server, error) {
+func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr, lastfmAPIKey, lastfmAPISecret string) (*Server, error) {
 	const dbPath = "/data/app.db"
 
 	// Create queue engine
@@ -77,6 +82,16 @@ func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr string) 
 		upnpStatus:       UPnPStatusUnconnected,
 		navidromeBaseURL: navidromeURL,
 		rendererName:     rendererAddr,
+	}
+
+	// Last.fm scrobbling (optional)
+	if lastfmAPIKey != "" {
+		lfmClient := lastfm.NewClient(lastfmAPIKey, lastfmAPISecret)
+		lfmStore, err := lastfm.NewStore(dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create lastfm store: %w", err)
+		}
+		srv.lastfmScrobbler = lastfm.NewScrobbler(lfmClient, lfmStore)
 	}
 
 	qe.RadioFillFunc = srv.radioFill
@@ -227,6 +242,15 @@ func (s *Server) StartPlaybackLoop() {
 							log.Printf("[playback] now playing: %q by %s", trackInfo.Title, trackInfo.Artist)
 							s.queueEngine.SetNowPlaying(trackInfo)
 							s.queueEngine.RemoveByTrackID(trackID)
+
+							if s.lastfmScrobbler != nil {
+								s.lastfmScrobbler.OnTrackChange(&lastfm.ScrobbleTrack{
+									Artist:   trackInfo.Artist,
+									Title:    trackInfo.Title,
+									Album:    trackInfo.Album,
+									Duration: trackInfo.Duration,
+								})
+							}
 						}
 					}
 					// Pre-queue next track for gapless
@@ -242,6 +266,10 @@ func (s *Server) StartPlaybackLoop() {
 			}
 
 			s.queueEngine.SetRenderer(*posInfo)
+
+			if s.lastfmScrobbler != nil && transportState == "PLAYING" {
+				s.lastfmScrobbler.OnPositionUpdate(posInfo.Position, posInfo.Duration)
+			}
 
 			// --- Auto-play on STOPPED ---
 			if lastTransportState != "STOPPED" && transportState == "STOPPED" {
@@ -367,7 +395,12 @@ func (s *Server) Routes() http.Handler {
 	// CORS middleware
 	r.Use(func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			if origin := r.Header.Get("Origin"); origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			if r.Method == "OPTIONS" {
@@ -392,6 +425,10 @@ func (s *Server) Routes() http.Handler {
 
 	// API routes
 	r.Route("/api", func(r chi.Router) {
+		if s.lastfmScrobbler != nil {
+			r.Use(s.sessionMiddleware)
+		}
+
 		r.Get("/search", s.handleSearch)
 		r.Get("/artist/albums", s.handleArtistAlbums)
 		r.Get("/album/tracks", s.handleAlbumTracks)
@@ -415,6 +452,15 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/radio", s.handleRadioToggle)
 		r.Get("/upnp/status", s.handleUPnPStatus)
 		r.Post("/upnp/reconnect", s.handleUPnPReconnect)
+
+		// Last.fm routes (only if configured)
+		if s.lastfmScrobbler != nil {
+			r.Get("/me", s.handleMe)
+			r.Put("/me/name", s.handleSetName)
+			r.Get("/lastfm/link", s.handleLastFMLink)
+			r.Get("/lastfm/callback", s.handleLastFMCallback)
+			r.Delete("/lastfm/link", s.handleLastFMUnlink)
+		}
 	})
 
 	return r
@@ -691,7 +737,7 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("{\"ok\":true}"))
 }
 
-// handleStop stops playback
+// handleStop stops playback, clears the queue, and ends all listening sessions
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.upnpMu.RLock()
 	control := s.upnpControl
@@ -699,7 +745,11 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if control != nil {
 		control.Stop()
 	}
+	s.queueEngine.Clear()
 	s.queueEngine.SetRunning(false)
+	if s.lastfmScrobbler != nil {
+		s.lastfmScrobbler.OnStop()
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("{\"ok\":true}"))
 }
@@ -748,6 +798,16 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	ch := s.queueEngine.Subscribe()
 	defer s.queueEngine.Unsubscribe(ch)
+
+	// Mark user as listening if they have a Last.fm link
+	if s.lastfmScrobbler != nil {
+		if userID := getUserID(r); userID != "" {
+			store := s.lastfmScrobbler.Store()
+			if _, _, err := store.GetLastFMLink(userID); err == nil {
+				store.SetListening(userID, time.Now().Add(12*time.Hour))
+			}
+		}
+	}
 
 	// Send initial state
 	state := s.queueEngine.State()
@@ -860,4 +920,188 @@ func (s *Server) handleUPnPReconnect(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "reconnect initiated"})
+}
+
+// --- Session middleware & Last.fm handlers ---
+
+type contextKey string
+
+const userIDKey contextKey = "userID"
+
+func getUserID(r *http.Request) string {
+	if v := r.Context().Value(userIDKey); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		store := s.lastfmScrobbler.Store()
+
+		cookie, err := r.Cookie("jukebox_session")
+		if err != nil || cookie.Value == "" {
+			// Generate new session
+			token := newSessionToken()
+			user, err := store.GetOrCreateUser(token)
+			if err != nil {
+				log.Printf("[session] failed to create user: %v", err)
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     "jukebox_session",
+				Value:    token,
+				Path:     "/",
+				MaxAge:   365 * 24 * 60 * 60,
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+			})
+			ctx := context.WithValue(r.Context(), userIDKey, user.ID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		user, err := store.GetOrCreateUser(cookie.Value)
+		if err != nil {
+			log.Printf("[session] failed to lookup user: %v", err)
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, user.ID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func newSessionToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"lastfmEnabled": s.lastfmScrobbler != nil,
+		})
+		return
+	}
+
+	store := s.lastfmScrobbler.Store()
+	user, err := store.GetUser(userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":            user.ID,
+		"name":          user.Name,
+		"lastfmUser":    nilIfEmpty(user.LastFMUser),
+		"isListening":   user.IsListening,
+		"lastfmEnabled": true,
+	})
+}
+
+func (s *Server) handleSetName(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "no session", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	store := s.lastfmScrobbler.Store()
+	if err := store.SetUserName(userID, req.Name); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("{\"ok\":true}"))
+}
+
+func (s *Server) handleLastFMLink(w http.ResponseWriter, r *http.Request) {
+	// Build callback URL from request
+	scheme := "http"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	callbackURL := fmt.Sprintf("%s://%s/api/lastfm/callback", scheme, host)
+	http.Redirect(w, r, s.lastfmScrobbler.AuthURL(callbackURL), http.StatusFound)
+}
+
+func (s *Server) handleLastFMCallback(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "missing token", http.StatusBadRequest)
+		return
+	}
+
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "no session", http.StatusUnauthorized)
+		return
+	}
+
+	sessionKey, lfmUser, err := s.lastfmScrobbler.GetSession(token)
+	if err != nil {
+		log.Printf("[lastfm] auth failed: %v", err)
+		http.Error(w, "Last.fm authorization failed", http.StatusBadGateway)
+		return
+	}
+
+	store := s.lastfmScrobbler.Store()
+	if err := store.LinkLastFM(userID, sessionKey, lfmUser); err != nil {
+		log.Printf("[lastfm] link failed: %v", err)
+		http.Error(w, "failed to save link", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[lastfm] linked user %s to Last.fm account %s", userID, lfmUser)
+
+	// Mark as listening immediately
+	store.SetListening(userID, time.Now().Add(12*time.Hour))
+
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *Server) handleLastFMUnlink(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "no session", http.StatusUnauthorized)
+		return
+	}
+
+	store := s.lastfmScrobbler.Store()
+	if err := store.UnlinkLastFM(userID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("{\"ok\":true}"))
+}
+
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
