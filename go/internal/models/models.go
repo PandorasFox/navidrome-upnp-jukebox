@@ -28,11 +28,32 @@ type PlaybackState struct {
 
 // SystemState represents the full application state for SSE broadcasts
 type SystemState struct {
-	Queue      []QueueItem   `json:"queue"`
-	NowPlaying *QueueItem    `json:"nowPlaying"`
-	Renderer   PlaybackState `json:"renderer"`
-	IsRunning  bool          `json:"isRunning"`
-	RadioMode  bool          `json:"radioMode"`
+	Queue        []QueueItem   `json:"queue"`
+	NowPlaying   *QueueItem    `json:"nowPlaying"`
+	Renderer     PlaybackState `json:"renderer"`
+	IsRunning    bool          `json:"isRunning"`
+	RadioMode    bool          `json:"radioMode"` // mirror of Radio.Enabled for back-compat
+	Radio        RadioConfig   `json:"radio"`
+	RadioFilling bool          `json:"radioFilling"`
+	Sync         SyncState     `json:"sync"`
+	UPnPStatus   string        `json:"upnpStatus"`
+}
+
+// RadioConfig controls the auto-fill behavior of radio mode
+type RadioConfig struct {
+	Enabled        bool `json:"enabled"`
+	SimilarSongs   bool `json:"similarSongs"`
+	SimilarArtists bool `json:"similarArtists"`
+	SimilarGenres  bool `json:"similarGenres"`
+	QueueThreshold int  `json:"queueThreshold"`
+	BatchSize      int  `json:"batchSize"`
+}
+
+// SyncState reports library sync progress
+type SyncState struct {
+	InProgress bool `json:"inProgress"`
+	SongCount  int  `json:"songCount"` // total in local DB; shown when idle
+	Synced     int  `json:"synced"`    // running tally during a sync
 }
 
 // SearchResponse matches Navidrome's Subsonic XML search results
@@ -67,4 +88,19 @@ type SearchTrack struct {
 	Track    int    `xml:"track,attr" json:"track"`
 	Duration int    `xml:"duration,attr" json:"duration"`
 	CoverArt string `xml:"coverArt,attr" json:"coverArt"`
+	Genre    string `xml:"genre,attr" json:"genre"`
+}
+
+// SimilarSongsResponse matches /rest/getSimilarSongs
+type SimilarSongsResponse struct {
+	SimilarSongs struct {
+		Song []SearchTrack `xml:"song"`
+	} `xml:"similarSongs"`
+}
+
+// RandomSongsResponse matches /rest/getRandomSongs
+type RandomSongsResponse struct {
+	RandomSongs struct {
+		Song []SearchTrack `xml:"song"`
+	} `xml:"randomSongs"`
 }

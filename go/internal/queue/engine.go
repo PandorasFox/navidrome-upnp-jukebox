@@ -12,6 +12,20 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// Default radio config values used when nothing has been persisted yet.
+const (
+	defaultQueueThreshold = 5
+	defaultBatchSize      = 10
+)
+
+func defaultRadioConfig() models.RadioConfig {
+	return models.RadioConfig{
+		Enabled:        false,
+		QueueThreshold: defaultQueueThreshold,
+		BatchSize:      defaultBatchSize,
+	}
+}
+
 // Engine manages the playback queue and state.
 // The queue holds upcoming tracks only; nowPlaying is set by the server
 // based on what the renderer is actually playing.
@@ -20,16 +34,47 @@ type Engine struct {
 	queue      []models.QueueItem
 	nowPlaying *models.QueueItem
 	isRunning  bool
-	radioMode  bool
+	radioCfg   models.RadioConfig
+	syncState  models.SyncState
 	renderer   models.PlaybackState
+	upnpStatus string
 	db         *sql.DB
 
-	// Called when radio mode is on and queue depth <= 3
+	// Called when radio mode is on and queue depth <= threshold.
+	// Always invoked off the request goroutine because fills can hit Navidrome
+	// for similarity lookups, which can take seconds.
 	RadioFillFunc func()
+	radioFilling  bool
 
 	// SSE subscribers
 	subMu       sync.RWMutex
 	subscribers map[chan []byte]struct{}
+}
+
+// triggerFillAsync runs RadioFillFunc in a goroutine, single-flighted so
+// repeated near-simultaneous triggers (e.g. Next + Remove) don't stack.
+// Broadcasts radioFilling=true at start and false at completion.
+func (e *Engine) triggerFillAsync() {
+	if e.RadioFillFunc == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.radioFilling {
+		e.mu.Unlock()
+		return
+	}
+	e.radioFilling = true
+	e.broadcastLocked()
+	e.mu.Unlock()
+	go func() {
+		defer func() {
+			e.mu.Lock()
+			e.radioFilling = false
+			e.broadcastLocked()
+			e.mu.Unlock()
+		}()
+		e.RadioFillFunc()
+	}()
 }
 
 // NewEngine creates a new queue engine
@@ -65,6 +110,7 @@ func NewEngine(dbPath string) (*Engine, error) {
 	e := &Engine{
 		queue:       make([]models.QueueItem, 0),
 		isRunning:   false,
+		radioCfg:    defaultRadioConfig(),
 		db:          db,
 		subscribers: make(map[chan []byte]struct{}),
 	}
@@ -73,10 +119,25 @@ func NewEngine(dbPath string) (*Engine, error) {
 		return nil, fmt.Errorf("failed to load queue: %w", err)
 	}
 
-	// Load persisted radio mode
-	var radioVal int
-	if err := db.QueryRow("SELECT value FROM settings WHERE key = 'radio_mode'").Scan(&radioVal); err == nil {
-		e.radioMode = radioVal == 1
+	// Load persisted radio config (JSON). Falls back to legacy radio_mode bool
+	// for users upgrading from a pre-config build.
+	var raw string
+	if err := db.QueryRow("SELECT value FROM settings WHERE key = 'radio_config'").Scan(&raw); err == nil {
+		var cfg models.RadioConfig
+		if err := json.Unmarshal([]byte(raw), &cfg); err == nil {
+			if cfg.QueueThreshold <= 0 {
+				cfg.QueueThreshold = defaultQueueThreshold
+			}
+			if cfg.BatchSize <= 0 {
+				cfg.BatchSize = defaultBatchSize
+			}
+			e.radioCfg = cfg
+		}
+	} else {
+		var radioVal int
+		if err := db.QueryRow("SELECT value FROM settings WHERE key = 'radio_mode'").Scan(&radioVal); err == nil {
+			e.radioCfg.Enabled = radioVal == 1
+		}
 	}
 
 	return e, nil
@@ -320,45 +381,84 @@ func (e *Engine) SetRunning(running bool) {
 	e.mu.Unlock()
 }
 
-// RadioMode returns whether radio mode is enabled
-func (e *Engine) RadioMode() bool {
+// RadioConfig returns a copy of the current radio configuration.
+func (e *Engine) RadioConfig() models.RadioConfig {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.radioMode
+	return e.radioCfg
 }
 
-// SetRadioMode enables or disables radio mode
-func (e *Engine) SetRadioMode(on bool) {
-	e.mu.Lock()
-	e.radioMode = on
-	val := 0
-	if on {
-		val = 1
+// SetRadioConfig updates the radio configuration, persists it, broadcasts the
+// new state, and triggers a fill if the queue is already at/below threshold.
+func (e *Engine) SetRadioConfig(cfg models.RadioConfig) {
+	if cfg.QueueThreshold <= 0 {
+		cfg.QueueThreshold = defaultQueueThreshold
 	}
-	e.db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES ('radio_mode', ?)", val)
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = defaultBatchSize
+	}
+	e.mu.Lock()
+	e.radioCfg = cfg
+	if raw, err := json.Marshal(cfg); err == nil {
+		e.db.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES ('radio_config', ?)", string(raw))
+	}
 	e.broadcastLocked()
-	needFill := on && len(e.queue) <= 3 && e.RadioFillFunc != nil
+	needFill := cfg.Enabled && len(e.queue) <= cfg.QueueThreshold && e.RadioFillFunc != nil
 	e.mu.Unlock()
 	if needFill {
-		e.RadioFillFunc()
+		e.triggerFillAsync()
 	}
 }
 
-// checkRadioFill triggers the fill callback if radio mode is on and queue is low.
+// checkRadioFill triggers the fill callback if radio mode is on and queue is at/below threshold.
+// Runs the fill on a background goroutine — similarity-pool fills make Navidrome
+// HTTP calls and can take seconds; we never want them blocking a request.
 // Must NOT be called while e.mu is held.
 func (e *Engine) checkRadioFill() {
 	e.mu.RLock()
-	needFill := e.radioMode && len(e.queue) <= 3 && e.RadioFillFunc != nil
+	needFill := e.radioCfg.Enabled && len(e.queue) <= e.radioCfg.QueueThreshold && e.RadioFillFunc != nil
 	e.mu.RUnlock()
 	if needFill {
-		e.RadioFillFunc()
+		e.triggerFillAsync()
 	}
+}
+
+// SetSyncState updates the library sync state and broadcasts.
+func (e *Engine) SetSyncState(s models.SyncState) {
+	e.mu.Lock()
+	e.syncState = s
+	e.broadcastLocked()
+	e.mu.Unlock()
+}
+
+// SyncState returns the current sync state.
+func (e *Engine) SyncState() models.SyncState {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.syncState
+}
+
+// QueueSnapshot returns a copy of the current queue safe to inspect outside the lock.
+func (e *Engine) QueueSnapshot() []models.QueueItem {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]models.QueueItem, len(e.queue))
+	copy(out, e.queue)
+	return out
 }
 
 // SetRenderer updates the renderer playback state and broadcasts
 func (e *Engine) SetRenderer(state models.PlaybackState) {
 	e.mu.Lock()
 	e.renderer = state
+	e.broadcastLocked()
+	e.mu.Unlock()
+}
+
+// SetUPnPStatus updates the UPnP connection status and broadcasts
+func (e *Engine) SetUPnPStatus(status string) {
+	e.mu.Lock()
+	e.upnpStatus = status
 	e.broadcastLocked()
 	e.mu.Unlock()
 }
@@ -379,11 +479,15 @@ func (e *Engine) State() models.SystemState {
 	copy(queue, e.queue)
 
 	return models.SystemState{
-		Queue:      queue,
-		NowPlaying: e.nowPlaying,
-		IsRunning:  e.isRunning,
-		Renderer:   e.renderer,
-		RadioMode:  e.radioMode,
+		Queue:        queue,
+		NowPlaying:   e.nowPlaying,
+		IsRunning:    e.isRunning,
+		Renderer:     e.renderer,
+		RadioMode:    e.radioCfg.Enabled,
+		Radio:        e.radioCfg,
+		RadioFilling: e.radioFilling,
+		Sync:         e.syncState,
+		UPnPStatus:   e.upnpStatus,
 	}
 }
 
@@ -391,11 +495,15 @@ func (e *Engine) State() models.SystemState {
 // Must be called while e.mu is held.
 func (e *Engine) broadcastLocked() {
 	state := models.SystemState{
-		Queue:      make([]models.QueueItem, len(e.queue)),
-		NowPlaying: e.nowPlaying,
-		IsRunning:  e.isRunning,
-		Renderer:   e.renderer,
-		RadioMode:  e.radioMode,
+		Queue:        make([]models.QueueItem, len(e.queue)),
+		NowPlaying:   e.nowPlaying,
+		IsRunning:    e.isRunning,
+		Renderer:     e.renderer,
+		RadioMode:    e.radioCfg.Enabled,
+		Radio:        e.radioCfg,
+		RadioFilling: e.radioFilling,
+		Sync:         e.syncState,
+		UPnPStatus:   e.upnpStatus,
 	}
 	copy(state.Queue, e.queue)
 	data, _ := json.Marshal(state)

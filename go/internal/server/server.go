@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,6 +84,7 @@ func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr, lastfmA
 		navidromeBaseURL: navidromeURL,
 		rendererName:     rendererAddr,
 	}
+	qe.SetUPnPStatus(UPnPStatusUnconnected)
 
 	// Last.fm scrobbling (optional)
 	if lastfmAPIKey != "" {
@@ -101,22 +103,16 @@ func NewServer(navidromeURL, navidromeUser, navidromePass, rendererAddr, lastfmA
 
 // StartUPnP discovers and connects to the renderer
 func (s *Server) StartUPnP() error {
-	s.upnpMu.Lock()
-	s.upnpStatus = UPnPStatusConnecting
-	s.upnpMu.Unlock()
+	s.setUPnPStatus(UPnPStatusConnecting)
 
 	log.Printf("Discovering UPnP renderer matching %q...", s.rendererName)
 	if err := s.upnpClient.Discover(); err != nil {
-		s.upnpMu.Lock()
-		s.upnpStatus = UPnPStatusUnconnected
-		s.upnpMu.Unlock()
+		s.setUPnPStatus(UPnPStatusUnconnected)
 		log.Printf("Failed to discover UPnP renderer: %v", err)
 		return fmt.Errorf("failed to discover renderer: %w", err)
 	}
 	s.upnpControl = s.upnpClient.NewControlPoint()
-	s.upnpMu.Lock()
-	s.upnpStatus = UPnPStatusConnected
-	s.upnpMu.Unlock()
+	s.setUPnPStatus(UPnPStatusConnected)
 	log.Printf("Connected to UPnP renderer")
 
 	// Pick up current renderer state (in case it's already playing)
@@ -171,6 +167,14 @@ func (s *Server) pickUpRendererState() {
 		// Pre-queue next for gapless
 		s.preQueueNext()
 	}
+}
+
+// setUPnPStatus updates the UPnP status on the server and broadcasts via SSE
+func (s *Server) setUPnPStatus(status string) {
+	s.upnpMu.Lock()
+	s.upnpStatus = status
+	s.upnpMu.Unlock()
+	s.queueEngine.SetUPnPStatus(status)
 }
 
 // GetUPnPStatus returns the current UPnP connection status
@@ -303,9 +307,27 @@ func (s *Server) preQueueNext() {
 	}
 }
 
-// SyncLibrary triggers a library sync
+// SyncLibrary triggers a library sync, broadcasting progress over SSE.
 func (s *Server) SyncLibrary(ctx context.Context) error {
-	return s.lib.Sync(ctx)
+	startCount := s.lib.GetSongCount()
+	s.queueEngine.SetSyncState(models.SyncState{
+		InProgress: true,
+		SongCount:  startCount,
+		Synced:     0,
+	})
+	err := s.lib.Sync(ctx, func(synced int) {
+		s.queueEngine.SetSyncState(models.SyncState{
+			InProgress: true,
+			SongCount:  startCount,
+			Synced:     synced,
+		})
+	})
+	s.queueEngine.SetSyncState(models.SyncState{
+		InProgress: false,
+		SongCount:  s.lib.GetSongCount(),
+		Synced:     0,
+	})
+	return err
 }
 
 // GetLibrary returns the library instance
@@ -449,7 +471,9 @@ func (s *Server) Routes() http.Handler {
 		r.Get("/cover/{id}", s.handleCoverArt)
 		r.Get("/sync/status", s.handleSyncStatus)
 		r.Post("/sync", s.handleSync)
-		r.Post("/radio", s.handleRadioToggle)
+		r.Post("/radio", s.handleRadioConfig)
+		r.Get("/genres", s.handleSearchGenres)
+		r.Get("/genre/tracks", s.handleGenreTracks)
 		r.Get("/upnp/status", s.handleUPnPStatus)
 		r.Post("/upnp/reconnect", s.handleUPnPReconnect)
 
@@ -884,28 +908,199 @@ func (s *Server) handleUPnPStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRadioToggle toggles radio mode
-func (s *Server) handleRadioToggle(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// handleRadioConfig accepts a full RadioConfig payload, persists it, and (if
+// enabled and queue is below threshold) immediately triggers a fill.
+func (s *Server) handleRadioConfig(w http.ResponseWriter, r *http.Request) {
+	var cfg models.RadioConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.queueEngine.SetRadioMode(req.Enabled)
-	log.Printf("[radio] mode set to %v", req.Enabled)
+	s.queueEngine.SetRadioConfig(cfg)
+	log.Printf("[radio] config: enabled=%v sim-songs=%v sim-artists=%v sim-genres=%v threshold=%d batch=%d",
+		cfg.Enabled, cfg.SimilarSongs, cfg.SimilarArtists, cfg.SimilarGenres, cfg.QueueThreshold, cfg.BatchSize)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte("{\"ok\":true}"))
 }
 
-// radioFill adds 10 random tracks to the queue
+// radioFill picks tracks based on the current RadioConfig and queue contents,
+// then appends them to the queue. With no similarity pools enabled, falls back
+// to today's behavior (random tracks from the library).
 func (s *Server) radioFill() {
-	tracks := s.lib.GetRandomTracks(10)
-	for _, t := range tracks {
+	cfg := s.queueEngine.RadioConfig()
+	batch := cfg.BatchSize
+	if batch <= 0 {
+		batch = 10
+	}
+
+	queueSnap := s.queueEngine.QueueSnapshot()
+	useSimilarity := cfg.SimilarSongs || cfg.SimilarArtists || cfg.SimilarGenres
+	if !useSimilarity || len(queueSnap) == 0 {
+		tracks := s.lib.GetRandomTracks(batch)
+		for _, t := range tracks {
+			s.queueEngine.Add(t)
+		}
+		log.Printf("[radio] added %d random tracks to queue", len(tracks))
+		return
+	}
+
+	// Bound the seeds so API call count stays predictable regardless of queue length.
+	const maxSeeds = 5
+	seeds := queueSnap
+	if len(seeds) > maxSeeds {
+		seeds = seeds[:maxSeeds]
+	}
+
+	already := make(map[string]struct{}, len(queueSnap))
+	for _, q := range queueSnap {
+		already[q.ID] = struct{}{}
+	}
+
+	candidates := make([]models.QueueItem, 0, batch*4)
+	addCandidate := func(item models.QueueItem) {
+		if item.ID == "" {
+			return
+		}
+		if _, ok := already[item.ID]; ok {
+			return
+		}
+		already[item.ID] = struct{}{}
+		candidates = append(candidates, item)
+	}
+
+	if cfg.SimilarSongs && s.navidrome != nil {
+		for _, seed := range seeds {
+			tracks, err := s.navidrome.GetSimilarSongs(seed.ID, 20)
+			if err != nil {
+				log.Printf("[radio] similar-songs lookup failed for %s: %v", seed.ID, err)
+				continue
+			}
+			for _, t := range tracks {
+				addCandidate(searchTrackToQueueItem(t))
+			}
+		}
+	}
+
+	if cfg.SimilarArtists {
+		seenArtists := map[string]struct{}{}
+		artists := []string{}
+		for _, q := range queueSnap {
+			if q.Artist == "" {
+				continue
+			}
+			if _, ok := seenArtists[q.Artist]; ok {
+				continue
+			}
+			seenArtists[q.Artist] = struct{}{}
+			artists = append(artists, q.Artist)
+		}
+		for _, t := range s.lib.GetRandomTracksByArtists(artists, batch*3) {
+			addCandidate(t)
+		}
+	}
+
+	if cfg.SimilarGenres {
+		ids := make([]string, 0, len(queueSnap))
+		for _, q := range queueSnap {
+			ids = append(ids, q.ID)
+		}
+		genres := s.lib.GenresOfTrackIDs(ids)
+		for _, t := range s.lib.GetRandomTracksByGenres(genres, batch*3) {
+			addCandidate(t)
+		}
+	}
+
+	if len(candidates) == 0 {
+		tracks := s.lib.GetRandomTracks(batch)
+		for _, t := range tracks {
+			s.queueEngine.Add(t)
+		}
+		log.Printf("[radio] no similarity candidates found, added %d random tracks", len(tracks))
+		return
+	}
+
+	mathrand.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+
+	pick := batch
+	if pick > len(candidates) {
+		pick = len(candidates)
+	}
+	for _, t := range candidates[:pick] {
 		s.queueEngine.Add(t)
 	}
-	log.Printf("[radio] added %d random tracks to queue", len(tracks))
+
+	// Top up with random library tracks if similarity didn't yield enough.
+	if pick < batch {
+		need := batch - pick
+		extras := s.lib.GetRandomTracks(need * 2)
+		added := 0
+		for _, t := range extras {
+			if _, ok := already[t.ID]; ok {
+				continue
+			}
+			already[t.ID] = struct{}{}
+			s.queueEngine.Add(t)
+			added++
+			if added >= need {
+				break
+			}
+		}
+		log.Printf("[radio] added %d similar + %d random tracks", pick, added)
+		return
+	}
+
+	log.Printf("[radio] added %d similar tracks (pools: songs=%v artists=%v genres=%v)",
+		pick, cfg.SimilarSongs, cfg.SimilarArtists, cfg.SimilarGenres)
+}
+
+// searchTrackToQueueItem converts a Navidrome SearchTrack into a QueueItem.
+// Used for results returned by the similarity endpoints — we don't always have
+// these tracks indexed locally.
+func searchTrackToQueueItem(t models.SearchTrack) models.QueueItem {
+	return models.QueueItem{
+		ID:       t.ID,
+		Title:    t.Title,
+		Artist:   t.Artist,
+		Album:    t.Album,
+		Duration: t.Duration,
+		CoverArt: t.CoverArt,
+	}
+}
+
+// handleSearchGenres returns distinct genres matching the query string.
+func (s *Server) handleSearchGenres(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	results, err := s.lib.SearchGenres(q)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"genres": results})
+}
+
+// handleGenreTracks returns all tracks with the given genre.
+func (s *Server) handleGenreTracks(w http.ResponseWriter, r *http.Request) {
+	genre := r.URL.Query().Get("genre")
+	if genre == "" {
+		http.Error(w, "missing genre", http.StatusBadRequest)
+		return
+	}
+	results, err := s.lib.GetTracksByGenre(genre)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"tracks": results})
 }
 
 // handleUPnPReconnect retries connecting to the renderer

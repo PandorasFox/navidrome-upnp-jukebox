@@ -151,6 +151,69 @@ func (c *Client) CoverArtURL(coverArtID string, size int) string {
 	return fmt.Sprintf("%s/rest/getCoverArt?%s", c.rendererBaseURL, params.Encode())
 }
 
+// GetSimilarSongs fetches tracks similar to the given track via /rest/getSimilarSongs.
+// On Navidrome with the AudioMuse-AI plugin installed, this is enriched with
+// AI-derived similarity beyond the default Last.fm-style suggestions.
+func (c *Client) GetSimilarSongs(trackID string, count int) ([]models.SearchTrack, error) {
+	params := url.Values{}
+	params.Set("v", "1.16.1")
+	params.Set("c", "navidrome-jukebox")
+	params.Set("u", c.username)
+	params.Set("p", c.password)
+	params.Set("id", trackID)
+	params.Set("count", fmt.Sprintf("%d", count))
+
+	reqURL := fmt.Sprintf("%s/rest/getSimilarSongs?%s", c.baseURL, params.Encode())
+
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var result models.SimilarSongsResponse
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return result.SimilarSongs.Song, nil
+}
+
+// GetRandomSongsByGenre fetches up to count random songs filtered to the given genre
+// via /rest/getRandomSongs.
+func (c *Client) GetRandomSongsByGenre(genre string, count int) ([]models.SearchTrack, error) {
+	params := url.Values{}
+	params.Set("v", "1.16.1")
+	params.Set("c", "navidrome-jukebox")
+	params.Set("u", c.username)
+	params.Set("p", c.password)
+	params.Set("genre", genre)
+	params.Set("size", fmt.Sprintf("%d", count))
+
+	reqURL := fmt.Sprintf("%s/rest/getRandomSongs?%s", c.baseURL, params.Encode())
+
+	resp, err := http.Get(reqURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var result models.RandomSongsResponse
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return result.RandomSongs.Song, nil
+}
+
 // SearchAll fetches all songs from the library (for full sync)
 // Uses search3 with empty query per Subsonic spec for offline sync
 func (c *Client) SearchAll(limit, offset int) ([]models.SearchTrack, error) {

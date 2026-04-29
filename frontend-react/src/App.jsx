@@ -12,7 +12,17 @@ function App() {
   const [searchMode, setSearchMode] = useState('tracks');
   const [searchResults, setSearchResults] = useState([]);
   const [addNext, setAddNext] = useState(false);
-  const [radioMode, setRadioMode] = useState(false);
+  const [radioCfg, setRadioCfg] = useState({
+    enabled: false,
+    similarSongs: false,
+    similarArtists: false,
+    similarGenres: false,
+    queueThreshold: 5,
+    batchSize: 10,
+  });
+  const [syncState, setSyncState] = useState({ inProgress: false, songCount: 0, synced: 0 });
+  const [radioFilling, setRadioFilling] = useState(false);
+  const [upnpStatus, setUpnpStatus] = useState('');
   const [user, setUser] = useState(null);
   const prevPositionRef = useRef(0);
   const [drillDown, setDrillDown] = useState(null);
@@ -38,7 +48,10 @@ function App() {
       setQueue(state.queue || []);
       setNowPlaying(state.nowPlaying || null);
       setIsRunning(state.isRunning ?? false);
-      setRadioMode(state.radioMode ?? false);
+      if (state.radio) setRadioCfg(state.radio);
+      if (state.sync) setSyncState(state.sync);
+      setRadioFilling(state.radioFilling ?? false);
+      if (state.upnpStatus) setUpnpStatus(state.upnpStatus);
       if (state.renderer) setRenderer(state.renderer);
     };
     return () => evtSource.close();
@@ -61,6 +74,12 @@ function App() {
     if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     searchTimeoutRef.current = setTimeout(async () => {
       try {
+        if (searchMode === 'genres') {
+          const res = await fetch(`${API}/genres?q=${encodeURIComponent(searchQuery)}`);
+          const data = await res.json();
+          setSearchResults(data.genres || []);
+          return;
+        }
         const res = await fetch(`${API}/search?q=${encodeURIComponent(searchQuery)}&type=${searchMode}`);
         const data = await res.json();
         if (searchMode === 'albums') setSearchResults(data.albums || []);
@@ -110,6 +129,16 @@ function App() {
     }
   };
 
+  const drillIntoGenre = async (genre) => {
+    try {
+      const res = await fetch(`${API}/genre/tracks?genre=${encodeURIComponent(genre.genre)}`);
+      const data = await res.json();
+      setDrillDown({ type: 'genreTracks', genre: genre.genre, tracks: data.tracks || [] });
+    } catch (err) {
+      console.error('Failed to load genre tracks:', err);
+    }
+  };
+
   const dismissSearch = () => {
     setSearchQuery('');
     setSearchResults([]);
@@ -147,13 +176,28 @@ function App() {
     dragOverItem.current = null;
   };
 
-  const toggleRadio = async () => {
-    await fetch(`${API}/radio`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: !radioMode }),
+  const radioPostTimer = useRef(null);
+  const postRadioCfg = (cfg) => {
+    if (radioPostTimer.current) clearTimeout(radioPostTimer.current);
+    radioPostTimer.current = setTimeout(() => {
+      fetch(`${API}/radio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg),
+      }).catch(() => {});
+    }, 250);
+  };
+  const updateRadio = (patch) => {
+    setRadioCfg((prev) => {
+      const next = { ...prev, ...patch };
+      postRadioCfg(next);
+      return next;
     });
   };
+
+  const triggerSync = () => fetch(`${API}/sync`, { method: 'POST' });
+
+  const reconnectUpnp = () => fetch(`${API}/upnp/reconnect`, { method: 'POST' });
 
   const play = () => fetch(`${API}/play`, { method: 'POST' });
   const pause = () => fetch(`${API}/pause`, { method: 'POST' });
@@ -217,6 +261,17 @@ function App() {
     </div>
   );
 
+  const renderGenreList = (genres) => (
+    genres.map((g) => (
+      <div key={g.genre} className="result-item" onClick={() => drillIntoGenre(g)}>
+        <div className="result-info">
+          <div className="result-title">{g.genre}</div>
+          <div className="result-artist">{g.trackCount} {g.trackCount === 1 ? 'track' : 'tracks'}</div>
+        </div>
+      </div>
+    ))
+  );
+
   const renderDrillDown = () => {
     if (!drillDown) return null;
 
@@ -260,6 +315,22 @@ function App() {
       );
     }
 
+    if (drillDown.type === 'genreTracks') {
+      const { genre, tracks } = drillDown;
+      return (
+        <>
+          <div className="drill-header">
+            <button className="back-btn" onClick={() => setDrillDown(null)}>←</button>
+            <div className="drill-info">
+              <div className="drill-title">{genre}</div>
+              <div className="drill-sub">{tracks.length} {tracks.length === 1 ? 'track' : 'tracks'}</div>
+            </div>
+          </div>
+          {renderTrackList(tracks)}
+        </>
+      );
+    }
+
     return null;
   };
 
@@ -270,6 +341,7 @@ function App() {
     if (searchMode === 'tracks') return renderTrackList(searchResults);
     if (searchMode === 'albums') return renderAlbumGrid(searchResults, drillIntoAlbum);
     if (searchMode === 'artists') return renderArtistGrid(searchResults);
+    if (searchMode === 'genres') return renderGenreList(searchResults);
     return null;
   };
 
@@ -279,24 +351,50 @@ function App() {
         <h1>navidrome upnp jukebox</h1>
       </header>
 
-      {user?.lastfmEnabled && (
-        <div className="lastfm-status">
-          {user.lastfmUser ? (
-            <span className="lastfm-linked">
-              <span className="lastfm-dot" />
-              {user.lastfmUser}
-              <button className="lastfm-unlink" onClick={async () => {
-                await fetch(`${API}/lastfm/link`, { method: 'DELETE' });
-                setUser(u => ({ ...u, lastfmUser: null }));
-              }}>unlink</button>
-            </span>
-          ) : (
-            <a href={`${API}/lastfm/link`} className="lastfm-link-btn">
-              Link Last.fm
-            </a>
-          )}
+      <div className="status-bar">
+        <div className="status-cell">
+          <span className={`upnp-dot ${upnpStatus}`} />
+          <span className="status-label">
+            {upnpStatus === 'connected' ? 'connected' :
+             upnpStatus === 'connecting' ? 'connecting...' : 'disconnected'}
+          </span>
+          <button className="status-btn" onClick={reconnectUpnp}
+            disabled={upnpStatus === 'connecting'}>
+            {upnpStatus === 'connected' ? 'reconnect' : 'connect'}
+          </button>
         </div>
-      )}
+
+        <div className="status-cell">
+          <span className={`sync-dot ${syncState.inProgress ? 'syncing' : 'idle'}`} />
+          <span className="status-label">
+            {syncState.inProgress
+              ? `syncing… ${syncState.synced.toLocaleString()}`
+              : `${syncState.songCount.toLocaleString()} songs`}
+          </span>
+          <button className="status-btn" onClick={triggerSync} disabled={syncState.inProgress}>
+            {syncState.inProgress ? '…' : 're-sync'}
+          </button>
+        </div>
+
+        {user?.lastfmEnabled && (
+          <div className="status-cell">
+            {user.lastfmUser ? (
+              <>
+                <span className="lastfm-dot" />
+                <span className="status-label">{user.lastfmUser}</span>
+                <button className="status-btn" onClick={async () => {
+                  await fetch(`${API}/lastfm/link`, { method: 'DELETE' });
+                  setUser(u => ({ ...u, lastfmUser: null }));
+                }}>unlink</button>
+              </>
+            ) : (
+              <a href={`${API}/lastfm/link`} className="lastfm-link-btn">
+                Link Last.fm
+              </a>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="search-container" ref={searchContainerRef}>
         <input
@@ -305,6 +403,7 @@ function App() {
           placeholder={
             searchMode === 'albums' ? 'Search for albums...' :
             searchMode === 'artists' ? 'Search for artists...' :
+            searchMode === 'genres' ? 'Search for genres...' :
             'Search for tracks...'
           }
           value={searchQuery}
@@ -324,6 +423,10 @@ function App() {
             <button className={`chip ${searchMode === 'artists' ? 'active' : ''}`}
               onClick={() => { setSearchMode('artists'); setSearchResults([]); setDrillDown(null); }}>
               Artists
+            </button>
+            <button className={`chip ${searchMode === 'genres' ? 'active' : ''}`}
+              onClick={() => { setSearchMode('genres'); setSearchResults([]); setDrillDown(null); }}>
+              Genres
             </button>
           </div>
           <label className="add-next-toggle" onClick={() => setAddNext(!addNext)}>
@@ -380,11 +483,57 @@ function App() {
         )}
         <button className="btn" onClick={stop}>⏹ Stop</button>
         <button className="btn" onClick={next} disabled={queue.length === 0}>⏭ Next</button>
-        <button className={`btn ${radioMode ? 'radio-active' : ''}`} onClick={toggleRadio}
-          title="Auto-adds 10 random songs to queue when queue is 3 or fewer items deep">
-          📻 Radio
-        </button>
         <button className="btn danger" onClick={clearQueue} disabled={queue.length === 0}>🗑 Clear</button>
+      </div>
+
+      <div className="radio-row">
+        <label className="toggle-label" onClick={() => updateRadio({ enabled: !radioCfg.enabled })}>
+          <span>📻 radio</span>
+          <span className={`toggle-switch ${radioCfg.enabled ? 'on' : ''}`}>
+            <span className="toggle-knob" />
+          </span>
+        </label>
+        {radioCfg.enabled && (
+          <>
+            <label className="toggle-label" onClick={() => updateRadio({ similarSongs: !radioCfg.similarSongs })}>
+              <span>similar songs</span>
+              <span className={`toggle-switch ${radioCfg.similarSongs ? 'on' : ''}`}>
+                <span className="toggle-knob" />
+              </span>
+            </label>
+            <label className="toggle-label" onClick={() => updateRadio({ similarArtists: !radioCfg.similarArtists })}>
+              <span>similar artists</span>
+              <span className={`toggle-switch ${radioCfg.similarArtists ? 'on' : ''}`}>
+                <span className="toggle-knob" />
+              </span>
+            </label>
+            <label className="toggle-label" onClick={() => updateRadio({ similarGenres: !radioCfg.similarGenres })}>
+              <span>similar genres</span>
+              <span className={`toggle-switch ${radioCfg.similarGenres ? 'on' : ''}`}>
+                <span className="toggle-knob" />
+              </span>
+            </label>
+            <label className="num-label">
+              <span>fill at ≤</span>
+              <input type="number" min="1" max="50" className="num-input"
+                value={radioCfg.queueThreshold}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  updateRadio({ queueThreshold: Number.isFinite(n) ? Math.max(1, Math.min(50, n)) : 5 });
+                }} />
+            </label>
+            <label className="num-label">
+              <span>add</span>
+              <input type="number" min="1" max="50" className="num-input"
+                value={radioCfg.batchSize}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  updateRadio({ batchSize: Number.isFinite(n) ? Math.max(1, Math.min(50, n)) : 10 });
+                }} />
+              <span>at a time</span>
+            </label>
+          </>
+        )}
       </div>
 
       <div className="queue-section">
@@ -414,6 +563,13 @@ function App() {
                 <button className="remove-btn" onClick={() => removeTrack(idx)} title="Remove">✕</button>
               </div>
             ))}
+          </div>
+        )}
+
+        {radioFilling && (
+          <div className="queue-spinner">
+            <span className="spinner" />
+            <span>queueing more…</span>
           </div>
         )}
       </div>

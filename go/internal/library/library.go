@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/hecate/navidrome-jukebox/internal/models"
@@ -37,7 +38,8 @@ func NewLibrary(dbPath string, client *navidrome.Client) (*Library, error) {
 			album_id TEXT DEFAULT '',
 			track_number INTEGER DEFAULT 0,
 			duration INTEGER DEFAULT 0,
-			cover_art TEXT
+			cover_art TEXT,
+			genre TEXT DEFAULT ''
 		);
 	`)
 	if err != nil {
@@ -48,9 +50,12 @@ func NewLibrary(dbPath string, client *navidrome.Client) (*Library, error) {
 	db.Exec(`ALTER TABLE songs ADD COLUMN duration INTEGER DEFAULT 0`)
 	db.Exec(`ALTER TABLE songs ADD COLUMN album_id TEXT DEFAULT ''`)
 	db.Exec(`ALTER TABLE songs ADD COLUMN track_number INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE songs ADD COLUMN genre TEXT DEFAULT ''`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_songs_title ON songs(title)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_songs_album ON songs(album)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_songs_album_id ON songs(album_id)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_songs_artist ON songs(artist)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_songs_genre ON songs(genre)`)
 
 	l := &Library{
 		db:     db,
@@ -67,8 +72,10 @@ func NewLibrary(dbPath string, client *navidrome.Client) (*Library, error) {
 	return l, nil
 }
 
-// Sync performs a full library sync from Navidrome
-func (l *Library) Sync(ctx context.Context) error {
+// Sync performs a full library sync from Navidrome.
+// onProgress, if non-nil, is called after each fetched page with the running
+// total of songs pulled so far — useful for streaming progress to the UI.
+func (l *Library) Sync(ctx context.Context, onProgress func(synced int)) error {
 	l.mu.Lock()
 	if l.isSyncing {
 		l.mu.Unlock()
@@ -102,6 +109,10 @@ func (l *Library) Sync(ctx context.Context) error {
 		allSongs = append(allSongs, songs...)
 		fmt.Printf("Fetched %d songs (total: %d)\n", len(songs), len(allSongs))
 
+		if onProgress != nil {
+			onProgress(len(allSongs))
+		}
+
 		if len(songs) < pageSize {
 			break
 		}
@@ -119,14 +130,14 @@ func (l *Library) Sync(ctx context.Context) error {
 		return fmt.Errorf("failed to clear songs: %w", err)
 	}
 
-	insertStmt, err := tx.Prepare("INSERT OR REPLACE INTO songs (id, title, artist, album, album_id, track_number, duration, cover_art) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	insertStmt, err := tx.Prepare("INSERT OR REPLACE INTO songs (id, title, artist, album, album_id, track_number, duration, cover_art, genre) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return fmt.Errorf("failed to prepare insert: %w", err)
 	}
 	defer insertStmt.Close()
 
 	for _, song := range allSongs {
-		_, err := insertStmt.Exec(song.ID, song.Title, song.Artist, song.Album, song.AlbumID, song.Track, song.Duration, song.CoverArt)
+		_, err := insertStmt.Exec(song.ID, song.Title, song.Artist, song.Album, song.AlbumID, song.Track, song.Duration, song.CoverArt, song.Genre)
 		if err != nil {
 			fmt.Printf("Warning: failed to insert song %s: %v\n", song.Title, err)
 			continue
@@ -381,6 +392,173 @@ func (l *Library) IsSyncing() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.isSyncing
+}
+
+// GetRandomTracksByArtists returns up to n random tracks where artist is in the
+// provided set. Returns empty slice if artists is empty.
+func (l *Library) GetRandomTracksByArtists(artists []string, n int) []models.QueueItem {
+	if len(artists) == 0 || n <= 0 {
+		return nil
+	}
+	placeholders := strings.Repeat("?,", len(artists))
+	placeholders = placeholders[:len(placeholders)-1]
+	query := fmt.Sprintf(`
+		SELECT id, title, artist, album, COALESCE(duration, 0), COALESCE(cover_art, '')
+		FROM songs WHERE artist IN (%s) ORDER BY RANDOM() LIMIT ?
+	`, placeholders)
+	args := make([]interface{}, 0, len(artists)+1)
+	for _, a := range artists {
+		args = append(args, a)
+	}
+	args = append(args, n)
+	rows, err := l.db.Query(query, args...)
+	if err != nil {
+		log.Printf("[library.GetRandomTracksByArtists] query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	var tracks []models.QueueItem
+	for rows.Next() {
+		var t models.QueueItem
+		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.Duration, &t.CoverArt); err != nil {
+			continue
+		}
+		tracks = append(tracks, t)
+	}
+	return tracks
+}
+
+// GetRandomTracksByGenres returns up to n random tracks where genre is in the
+// provided set. Empty/blank genres in the input are ignored.
+func (l *Library) GetRandomTracksByGenres(genres []string, n int) []models.QueueItem {
+	clean := make([]string, 0, len(genres))
+	for _, g := range genres {
+		if strings.TrimSpace(g) != "" {
+			clean = append(clean, g)
+		}
+	}
+	if len(clean) == 0 || n <= 0 {
+		return nil
+	}
+	placeholders := strings.Repeat("?,", len(clean))
+	placeholders = placeholders[:len(placeholders)-1]
+	query := fmt.Sprintf(`
+		SELECT id, title, artist, album, COALESCE(duration, 0), COALESCE(cover_art, '')
+		FROM songs WHERE genre IN (%s) ORDER BY RANDOM() LIMIT ?
+	`, placeholders)
+	args := make([]interface{}, 0, len(clean)+1)
+	for _, g := range clean {
+		args = append(args, g)
+	}
+	args = append(args, n)
+	rows, err := l.db.Query(query, args...)
+	if err != nil {
+		log.Printf("[library.GetRandomTracksByGenres] query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	var tracks []models.QueueItem
+	for rows.Next() {
+		var t models.QueueItem
+		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.Duration, &t.CoverArt); err != nil {
+			continue
+		}
+		tracks = append(tracks, t)
+	}
+	return tracks
+}
+
+// GenresOfTrackIDs returns the distinct, non-empty set of genres that appear
+// across the supplied track IDs.
+func (l *Library) GenresOfTrackIDs(trackIDs []string) []string {
+	if len(trackIDs) == 0 {
+		return nil
+	}
+	placeholders := strings.Repeat("?,", len(trackIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	query := fmt.Sprintf(`SELECT DISTINCT genre FROM songs WHERE id IN (%s) AND genre != ''`, placeholders)
+	args := make([]interface{}, 0, len(trackIDs))
+	for _, id := range trackIDs {
+		args = append(args, id)
+	}
+	rows, err := l.db.Query(query, args...)
+	if err != nil {
+		log.Printf("[library.GenresOfTrackIDs] query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	var genres []string
+	for rows.Next() {
+		var g string
+		if err := rows.Scan(&g); err != nil {
+			continue
+		}
+		genres = append(genres, g)
+	}
+	return genres
+}
+
+// SearchGenres returns distinct genres matching the query, with track counts.
+func (l *Library) SearchGenres(query string) ([]map[string]interface{}, error) {
+	rows, err := l.db.Query(`
+		SELECT genre, COUNT(*) as track_count
+		FROM songs
+		WHERE genre != '' AND LOWER(genre) LIKE LOWER(?)
+		GROUP BY genre
+		ORDER BY track_count DESC, genre
+		LIMIT 50
+	`, "%"+query+"%")
+	if err != nil {
+		return nil, fmt.Errorf("failed to search genres: %w", err)
+	}
+	defer rows.Close()
+	var results []map[string]interface{}
+	for rows.Next() {
+		var genre string
+		var trackCount int
+		if err := rows.Scan(&genre, &trackCount); err != nil {
+			log.Printf("[library.SearchGenres] scan error: %v", err)
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"genre":      genre,
+			"trackCount": trackCount,
+		})
+	}
+	return results, rows.Err()
+}
+
+// GetTracksByGenre returns all tracks for a given genre (case-insensitive exact match).
+func (l *Library) GetTracksByGenre(genre string) ([]map[string]interface{}, error) {
+	rows, err := l.db.Query(`
+		SELECT id, title, artist, album, COALESCE(duration, 0), COALESCE(cover_art, ''), track_number
+		FROM songs
+		WHERE LOWER(genre) = LOWER(?)
+		ORDER BY artist, album, track_number
+		LIMIT 500
+	`, genre)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tracks by genre: %w", err)
+	}
+	defer rows.Close()
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id, title, artist, album, coverArt string
+		var duration, trackNumber int
+		if err := rows.Scan(&id, &title, &artist, &album, &duration, &coverArt, &trackNumber); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"id":       id,
+			"title":    title,
+			"artist":   artist,
+			"album":    album,
+			"duration": duration,
+			"coverArt": coverArt,
+			"track":    trackNumber,
+		})
+	}
+	return results, rows.Err()
 }
 
 func (l *Library) Close() error {
