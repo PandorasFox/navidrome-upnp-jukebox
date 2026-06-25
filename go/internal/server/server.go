@@ -165,11 +165,15 @@ func (s *Server) pickUpRendererState() {
 
 	s.queueEngine.SetRenderer(*posInfo)
 
-	if transportState == "PLAYING" || transportState == "PAUSED_PLAYBACK" {
-		log.Printf("[startup] renderer is %s, syncing state", transportState)
+	// Only adopt the renderer's playback if it's actually one of our tracks.
+	// Otherwise the receiver might be on TV/HDMI input and we'd inject music.
+	if (transportState == "PLAYING" || transportState == "PAUSED_PLAYBACK") && s.queueEngine.NowPlaying() != nil {
+		log.Printf("[startup] renderer is %s with jukebox track, syncing state", transportState)
 		s.queueEngine.SetRunning(true)
 		// Pre-queue next for gapless
 		s.preQueueNext()
+	} else if transportState == "PLAYING" || transportState == "PAUSED_PLAYBACK" {
+		log.Printf("[startup] renderer is %s but URI isn't ours, leaving it alone", transportState)
 	}
 }
 
@@ -263,10 +267,12 @@ func (s *Server) StartPlaybackLoop() {
 									Duration: trackInfo.Duration,
 								})
 							}
+							// Pre-queue next track for gapless. Only do this
+							// when the renderer is playing one of our tracks,
+							// otherwise we'd inject music after TV/HDMI audio.
+							s.preQueueNext()
 						}
 					}
-					// Pre-queue next track for gapless
-					s.preQueueNext()
 				}
 			}
 
@@ -284,7 +290,12 @@ func (s *Server) StartPlaybackLoop() {
 			}
 
 			// --- Auto-play on STOPPED ---
-			if lastTransportState != "STOPPED" && transportState == "STOPPED" {
+			// Only treat PLAYING -> STOPPED as end-of-track, and only when
+			// we know a jukebox track was playing. A PAUSED -> STOPPED
+			// transition is the renderer giving up on a long pause; an
+			// arbitrary PLAYING -> STOPPED with no nowPlaying is the receiver
+			// being used for TV/HDMI audio and is none of our business.
+			if lastTransportState == "PLAYING" && transportState == "STOPPED" && s.queueEngine.NowPlaying() != nil {
 				s.playNextInQueue()
 			}
 			lastTransportState = transportState
@@ -374,9 +385,11 @@ func (s *Server) playTrack(track *models.QueueItem) error {
 	// Build DIDL-Lite metadata
 	meta := upnp.DIDLItem(*track, streamURL)
 
-	// Replace cover art placeholder with actual URL
+	// Replace cover art placeholder with actual URL. The URL is a Subsonic
+	// query string with multiple '&' separators that must be XML-escaped or
+	// the whole albumArtURI element parses as malformed on strict renderers.
 	if track.CoverArt != "" {
-		coverURL := s.navidrome.CoverArtURL(track.CoverArt, 300)
+		coverURL := strings.ReplaceAll(s.navidrome.CoverArtURL(track.CoverArt, 300), "&", "&amp;")
 		meta = strings.Replace(meta, fmt.Sprintf("__COVER_ART_%s__", track.CoverArt), coverURL, -1)
 	}
 
@@ -407,7 +420,7 @@ func (s *Server) queueNextTrack(track *models.QueueItem) error {
 	meta := upnp.DIDLItem(*track, streamURL)
 
 	if track.CoverArt != "" {
-		coverURL := s.navidrome.CoverArtURL(track.CoverArt, 300)
+		coverURL := strings.ReplaceAll(s.navidrome.CoverArtURL(track.CoverArt, 300), "&", "&amp;")
 		meta = strings.Replace(meta, fmt.Sprintf("__COVER_ART_%s__", track.CoverArt), coverURL, -1)
 	}
 
@@ -777,6 +790,15 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.queueEngine.SetRunning(true)
+	} else if np != nil {
+		// We know what was playing but the renderer dropped it (e.g. Yamaha
+		// timed out a long pause to STOPPED). Restart the same track rather
+		// than skipping ahead in the queue.
+		s.queueEngine.SetRunning(true)
+		log.Printf("[play] renderer idle, restarting: %s - %s", np.Artist, np.Title)
+		if err := s.playTrack(np); err != nil {
+			log.Printf("[play] error: %v", err)
+		}
 	} else {
 		// Nothing loaded — pop next from queue
 		next := s.queueEngine.PopNext()

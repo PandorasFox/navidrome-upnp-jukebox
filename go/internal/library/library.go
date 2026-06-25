@@ -96,31 +96,60 @@ func (l *Library) Sync(ctx context.Context, onProgress func(synced int)) error {
 
 	fmt.Println("Starting library sync...")
 
+	// Pull pages in parallel batches. Subsonic search3 doesn't advertise a
+	// total count, so we fetch batchSize pages concurrently and stop the loop
+	// as soon as any page in a batch comes back short. Pages past that one in
+	// the same batch are wasted (they'd be empty), but the speedup over a
+	// serial fetch of a 200k+ track library is worth it.
 	const pageSize = 500
+	const batchSize = 10
+
 	var allSongs []models.SearchTrack
-	var songOffset int
+	pageIdx := 0
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		songs, err := l.client.SearchAll(pageSize, songOffset)
-		if err != nil {
-			return fmt.Errorf("failed to search: %w", err)
+		results := make([][]models.SearchTrack, batchSize)
+		errs := make([]error, batchSize)
+
+		var wg sync.WaitGroup
+		for i := 0; i < batchSize; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				offset := (pageIdx + i) * pageSize
+				songs, err := l.client.SearchAll(pageSize, offset)
+				results[i] = songs
+				errs[i] = err
+			}(i)
+		}
+		wg.Wait()
+
+		done := false
+		for i := 0; i < batchSize; i++ {
+			if errs[i] != nil {
+				return fmt.Errorf("failed to search: %w", errs[i])
+			}
+			allSongs = append(allSongs, results[i]...)
+			if len(results[i]) < pageSize {
+				done = true
+				break
+			}
 		}
 
-		allSongs = append(allSongs, songs...)
-		fmt.Printf("Fetched %d songs (total: %d)\n", len(songs), len(allSongs))
+		fmt.Printf("Fetched batch of %d pages from offset %d (total: %d)\n", batchSize, pageIdx*pageSize, len(allSongs))
 
 		if onProgress != nil {
 			onProgress(len(allSongs))
 		}
 
-		if len(songs) < pageSize {
+		if done {
 			break
 		}
-		songOffset += pageSize
+		pageIdx += batchSize
 	}
 
 	tx, err := l.db.Begin()

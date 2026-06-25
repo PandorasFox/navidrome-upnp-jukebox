@@ -351,10 +351,16 @@ func DIDLItem(track models.QueueItem, streamURL string) string {
 
 	albumArt := ""
 	if track.CoverArt != "" {
-		albumArt = fmt.Sprintf("\n    <upnp:albumArtURI>__COVER_ART_%s__</upnp:albumArtURI>", track.CoverArt)
+		// dlna:profileID is required by stricter renderers (incl. RX-A4A) to
+		// honor an out-of-band art URI; without it they fall back to in-stream
+		// embedded art, which the Navidrome raw stream often doesn't carry in
+		// a form the Yamaha will parse. JPEG_SM covers 640x480 — enough for
+		// the 300px thumbnails we request from Navidrome (JPEG_TN caps at
+		// 160x160 and gets rejected on profile-mismatch grounds).
+		albumArt = fmt.Sprintf("\n    <upnp:albumArtURI dlna:profileID=\"JPEG_SM\">__COVER_ART_%s__</upnp:albumArtURI>", track.CoverArt)
 	}
 
-	return fmt.Sprintf(`<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+	return fmt.Sprintf(`<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">
   <item id="%s" parentID="0" restricted="1">
     <dc:title>%s</dc:title>
     <dc:creator>%s</dc:creator>
